@@ -164,12 +164,22 @@ nothing_to_do() {
   ((${#OSDS[@]} == 0)) && [ -z "$(service_daemons)" ]
 }
 
+# `orch host ls` reports a host that is in maintenance but not yet reachable
+# (e.g. just rebooted) as "Offline", hiding the maintenance state, so also
+# consult the HOST_IN_MAINTENANCE health check, which lists it either way.
 in_maintenance() {
-  ceph orch host ls -f json | py '
+  local hosts health
+  hosts=$(ceph orch host ls -f json)
+  health=$(ceph health detail -f json)
+  [ "$(py '
 import json, sys
-print(any(h["hostname"] == sys.argv[1] and h.get("status", "").lower() == "maintenance"
-          for h in json.load(sys.stdin)))
-' "$ORCH_HOST" | grep -qx True
+host = sys.argv[1]
+orch = any(h["hostname"] == host and h.get("status", "").lower() == "maintenance"
+           for h in json.loads(sys.argv[2]))
+checks = json.loads(sys.argv[3]).get("checks", {})
+msgs = [d.get("message", "") for d in checks.get("HOST_IN_MAINTENANCE", {}).get("detail", [])]
+print(orch or any(m.split()[:1] == [host] for m in msgs))
+' "$ORCH_HOST" "$hosts" "$health")" = True ]
 }
 
 # One line per OSD on the host: id up in primary_affinity flags
