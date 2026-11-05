@@ -40,7 +40,6 @@ PROG=${0##*/}
 SETTLE_TIMEOUT=${CEPH_HOST_MAINT_SETTLE_TIMEOUT:-1800}  # max wait for PGs to settle, seconds
 BOOT_TIMEOUT=${CEPH_HOST_MAINT_BOOT_TIMEOUT:-900}       # max wait for daemons / an OSD to come up
 BOOT_SETTLE=${CEPH_HOST_MAINT_BOOT_SETTLE:-30}          # pause after daemons start, before releasing OSDs
-RESTORE_PAUSE=${CEPH_HOST_MAINT_RESTORE_PAUSE:-30}      # pause between primary-affinity restores
 SLOW_OPS_WAIT=${CEPH_HOST_MAINT_SLOW_OPS_WAIT:-120}     # extra wait for SLOW_OPS to clear (soft)
 POLL=${CEPH_HOST_MAINT_POLL:-5}
 FORCE=${CEPH_HOST_MAINT_FORCE:-0}                       # 1 = enter even if PGs are not active+clean
@@ -80,7 +79,6 @@ Environment (seconds unless noted):
   CEPH_HOST_MAINT_SETTLE_TIMEOUT  ($SETTLE_TIMEOUT)  wait for PGs to settle
   CEPH_HOST_MAINT_BOOT_TIMEOUT    ($BOOT_TIMEOUT)  wait for daemons / an OSD to come up
   CEPH_HOST_MAINT_BOOT_SETTLE     ($BOOT_SETTLE)  pause after daemons start
-  CEPH_HOST_MAINT_RESTORE_PAUSE   ($RESTORE_PAUSE)  pause between affinity restores
   CEPH_HOST_MAINT_SLOW_OPS_WAIT   ($SLOW_OPS_WAIT)  extra wait for SLOW_OPS to clear
   CEPH_HOST_MAINT_FORCE           ($FORCE)  1 = enter even if PGs are not clean
 EOF
@@ -418,7 +416,7 @@ cmd_enter() {
       if osd_table | awk '$4 + 0 == 0 { found = 1 } END { exit !found }'; then
         log "WARNING: some OSDs already have primary affinity 0; saving that as their normal value"
       fi
-      ceph config-key set "$KEY" "$saved" >/dev/null
+      ceph config-key set "$KEY" "$saved" >/dev/null 2>&1
       log "saved primary affinity: $saved"
     else
       log "keeping previously saved primary affinity: $(ceph config-key get "$KEY")"
@@ -430,16 +428,21 @@ cmd_enter() {
     ceph osd set-group noout $(osd_names)
     log "set noout on $(osd_names)"
 
-    local id
+    # All at once: this only hands the primary role to replicas that are
+    # already current, the same brief peering a host leaving causes. The
+    # pacing that matters is on the rejoin side (cmd_exit).
+    local id changed=()
     for id in "${OSDS[@]}"; do
-      if same_number "$(osd_affinity "$id")" 0; then
-        continue
-      fi
-      log "moving primaries off osd.$id"
-      ceph osd primary-affinity "osd.$id" 0
-      settle "$PEERING_STATES" "after osd.$id primary-affinity 0" \
-        || die "PGs did not settle; re-run '$PROG enter $CRUSH_HOST' to continue"
+      same_number "$(osd_affinity "$id")" 0 && continue
+      ceph osd primary-affinity "osd.$id" 0 >/dev/null 2>&1 \
+        || die "could not set primary affinity on osd.$id; re-run '$PROG enter $CRUSH_HOST' to continue"
+      changed+=("osd.$id")
     done
+    if ((${#changed[@]})); then
+      log "moved primaries off ${changed[*]}"
+      settle "$PEERING_STATES" "after moving primaries off $CRUSH_HOST" \
+        || die "PGs did not settle; re-run '$PROG enter $CRUSH_HOST' to continue"
+    fi
   fi
 
   log "entering cephadm maintenance on $ORCH_HOST"
@@ -462,6 +465,9 @@ restore_affinity() {
     fi
     return 0
   fi
+  # All at once, like enter: every OSD has finished recovering by now, so
+  # this only hands primaries back to current replicas.
+  local changed=()
   for pair in $saved; do
     id=${pair%%=*}
     aff=${pair#*=}
@@ -470,16 +476,17 @@ restore_affinity() {
       log "osd.$id is no longer on $CRUSH_HOST; skipping its saved affinity ($aff)"
       continue
     fi
-    if same_number "$cur" "$aff"; then
-      continue
-    fi
-    log "restoring osd.$id primary affinity to $aff"
-    ceph osd primary-affinity "osd.$id" "$aff"
-    settle "$PEERING_STATES" "after restoring osd.$id primary affinity" \
-      || die "PGs did not settle; re-run '$PROG exit $CRUSH_HOST' to continue"
-    sleep "$RESTORE_PAUSE"
+    same_number "$cur" "$aff" && continue
+    ceph osd primary-affinity "osd.$id" "$aff" >/dev/null 2>&1 \
+      || die "could not restore primary affinity on osd.$id; re-run '$PROG exit $CRUSH_HOST' to continue"
+    changed+=("osd.$id=$aff")
   done
-  ceph config-key rm "$KEY" >/dev/null
+  if ((${#changed[@]})); then
+    log "restored primary affinity: ${changed[*]}"
+    settle "$PEERING_STATES" "after restoring primary affinity" \
+      || die "PGs did not settle; re-run '$PROG exit $CRUSH_HOST' to continue"
+  fi
+  ceph config-key rm "$KEY" >/dev/null 2>&1
 }
 
 cmd_exit() {

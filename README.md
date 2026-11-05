@@ -356,18 +356,23 @@ cheap; rejoining is not.
   OSD/mon that is unsafe to stop, a service with no other instance) is not
   overridden. It then saves each OSD's primary affinity in the config-key
   store, sets per-OSD `noout`, moves primaries off the host
-  (`primary-affinity 0`, one OSD at a time, waiting for peering), and enters
-  cephadm maintenance. The OSDs stay down across any number of reboots until
-  `exit`.
+  (`primary-affinity 0` on all of its OSDs at once, then one wait for
+  peering), and enters cephadm maintenance. The OSDs stay down across any
+  number of reboots until `exit`.
 * `exit` holds the host's OSDs with per-OSD `noup`, exits cephadm
   maintenance, then releases one OSD at a time. Before releasing the next it
   waits for peering and recovery to finish and gives any slow ops a short
   chance to clear. It then clears `noout` and restores the saved primary
-  affinity one OSD at a time. It does not wait for the whole cluster to be
+  affinity, all at once. It does not wait for the whole cluster to be
   `active+clean`, only for this host's recovery, so unrelated problems
   elsewhere do not block it.
 * `status` shows the maintenance state, per-OSD flags, primary affinity and
   a PG summary.
+
+Only the rejoin is paced. Moving primaries off a host, and back once it has
+recovered, just hands the primary role to replicas that are already current,
+which is the same short peering a host leaving causes, so it is done in one
+step.
 
 "Settled" means no PGs in a busy state for three samples in a row, because
 the mgr's PG stats lag the OSD map by a few seconds.
