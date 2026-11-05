@@ -349,7 +349,10 @@ cheap; rejoining is not.
   (`ceph orch host ok-to-stop`), failing over an active mgr on it. If the
   check fails it stops before changing anything. On hosts running RGW or NFS
   the check only warns that clients may lose connectivity; accept that with
-  `enter <host> -- --force`. It then saves each OSD's primary affinity in the
+  `enter <host> -- --force` once you know the other daemons (or a VIP) cover
+  for this host. `--force` is accepted only when every line of the refusal
+  is such a WARNING, because cephadm's own `--force` does not override a
+  mon/OSD/MDS refusal or an active mgr. It then saves each OSD's primary affinity in the
   config-key store, sets per-OSD `noout`, moves primaries off the host
   (`primary-affinity 0`, one OSD at a time, waiting for peering), and enters
   cephadm maintenance. The OSDs stay down across any number of reboots until

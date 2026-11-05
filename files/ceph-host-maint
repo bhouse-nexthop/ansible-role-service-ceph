@@ -318,11 +318,22 @@ print(" ".join(d["daemon_id"] for d in json.load(sys.stdin)))
       || die "mgr did not fail over; re-run when 'ceph mgr stat' shows a new active"
   fi
 
-  local out
+  # --force on `maintenance enter` only bypasses the "not enough daemons
+  # left" WARNINGs (rgw, nfs, ...). A mon/osd/mds refusal is not bypassed,
+  # so accept --force only when every line of the refusal is such a WARNING;
+  # otherwise we would drain the host and then have cephadm refuse anyway.
+  local out others only_warnings=0
   if ! out=$(ceph orch host ok-to-stop "$ORCH_HOST" 2>&1); then
-    if printf '%s\n' "$out" | grep -q '^ALERT' || ! has_extra_arg --force; then
+    # Capture rather than `grep -q`: under pipefail an early-exiting grep
+    # SIGPIPEs the writer and the pipeline reports failure.
+    others=$(printf '%s\n' "$out" | sed -e 's/^Error E[A-Z]*: //' -e '/^[[:space:]]*$/d' | grep -v '^WARNING:' || true)
+    [ -n "$others" ] || only_warnings=1
+    if [ "$only_warnings" != 1 ] || ! has_extra_arg --force; then
       printf '%s\n' "$out" >&2
-      die "cephadm says $ORCH_HOST is not ok to stop. Nothing has been changed. If only WARNING lines are shown, re-run with '-- --force'."
+      if [ "$only_warnings" = 1 ]; then
+        die "cephadm says $ORCH_HOST is not ok to stop. Nothing has been changed. These are only WARNINGs; if the other daemons cover for this host, re-run with '-- --force'."
+      fi
+      die "cephadm says $ORCH_HOST is not ok to stop. Nothing has been changed. --force does not override this; fix the cause first."
     fi
     log "ok-to-stop warnings accepted with --force:"
     printf '%s\n' "$out" | sed 's/^/    /' >&2
