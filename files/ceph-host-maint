@@ -71,9 +71,10 @@ host defaults to this machine. Short names and FQDNs are both accepted. A
 host that is not in the Ceph cluster (or has no OSDs or Ceph services) is a
 no-op when defaulted, and an error when named explicitly.
 
-Extra args go to 'ceph orch host maintenance enter|exit', e.g. '-- --force'
-to accept the RGW/NFS "clients may lose connectivity" warnings, or to exit
-an offline host.
+Extra args go to 'ceph orch host maintenance enter|exit', e.g.
+'exit <host> -- --force' for a host that is offline. enter adds --force
+itself when cephadm's only objection is RGW/NFS-style warnings and every
+affected service still runs on another host.
 
 Environment (seconds unless noted):
   CEPH_HOST_MAINT_SETTLE_TIMEOUT  ($SETTLE_TIMEOUT)  wait for PGs to settle
@@ -318,25 +319,66 @@ print(" ".join(d["daemon_id"] for d in json.load(sys.stdin)))
       || die "mgr did not fail over; re-run when 'ceph mgr stat' shows a new active"
   fi
 
-  # --force on `maintenance enter` only bypasses the "not enough daemons
-  # left" WARNINGs (rgw, nfs, ...). A mon/osd/mds refusal is not bypassed,
-  # so accept --force only when every line of the refusal is such a WARNING;
-  # otherwise we would drain the host and then have cephadm refuse anyway.
-  local out others only_warnings=0
+  # cephadm refuses with WARNINGs whenever a host runs rgw/nfs-style
+  # daemons, however many other instances there are. Its --force bypasses
+  # exactly those WARNINGs and nothing else (not a mon/osd/mds refusal, not
+  # an active mgr). So: if every line of the refusal is such a WARNING and
+  # each affected service still has a running daemon on another active
+  # host, pass --force ourselves. Anything else stops here, before any
+  # change is made. How clients find the surviving daemons (VIP, DNS,
+  # client-side lists) is the job of whatever fronts the service.
+  local out
   if ! out=$(ceph orch host ok-to-stop "$ORCH_HOST" 2>&1); then
-    # Capture rather than `grep -q`: under pipefail an early-exiting grep
-    # SIGPIPEs the writer and the pipeline reports failure.
-    others=$(printf '%s\n' "$out" | sed -e 's/^Error E[A-Z]*: //' -e '/^[[:space:]]*$/d' | grep -v '^WARNING:' || true)
-    [ -n "$others" ] || only_warnings=1
-    if [ "$only_warnings" != 1 ] || ! has_extra_arg --force; then
-      printf '%s\n' "$out" >&2
-      if [ "$only_warnings" = 1 ]; then
-        die "cephadm says $ORCH_HOST is not ok to stop. Nothing has been changed. These are only WARNINGs; if the other daemons cover for this host, re-run with '-- --force'."
-      fi
-      die "cephadm says $ORCH_HOST is not ok to stop. Nothing has been changed. --force does not override this; fix the cause first."
-    fi
-    log "ok-to-stop warnings accepted with --force:"
-    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    local verdict
+    verdict=$(ceph orch ps -f json | py '
+import json, re, sys
+host, refusal, hosts_json = sys.argv[1], sys.argv[2], sys.argv[3]
+daemons = json.load(sys.stdin)
+types, other = set(), []
+for line in refusal.splitlines():
+    line = re.sub(r"^Error E[A-Z]+: ", "", line).strip()
+    if not line:
+        continue
+    m = re.match(r"WARNING: Removing (\S+) daemons can cause clients to lose connectivity", line)
+    if m:
+        types.add(m.group(1).lower())
+    else:
+        other.append(line)
+if other:
+    print("REFUSE " + " | ".join(other))
+    sys.exit()
+down = {h["hostname"] for h in json.loads(hosts_json)
+        if h.get("status", "").lower() in ("maintenance", "offline")}
+problems, covered = [], []
+for t in sorted(types):
+    mine = {d.get("service_name") for d in daemons
+            if d["daemon_type"] == t and d["hostname"] == host}
+    if not mine:
+        problems.append(f"cephadm warned about {t} but no {t} daemon is on this host")
+    for svc in sorted(mine):
+        peers = sorted(d["hostname"].split(".")[0] for d in daemons
+                       if d.get("service_name") == svc and d["hostname"] != host
+                       and d["hostname"] not in down and d.get("status_desc") == "running")
+        if peers:
+            covered.append("%s (also on %s)" % (svc, ",".join(peers)))
+        else:
+            problems.append(f"{svc} has no running daemon on another active host")
+if problems:
+    print("REFUSE " + "; ".join(problems))
+else:
+    print("OK " + ", ".join(covered))
+' "$ORCH_HOST" "$out" "$(ceph orch host ls -f json)")
+    case "$verdict" in
+      OK\ *)
+        log "cephadm warns that stopping ${verdict#OK } may affect clients; each still runs on another host, so passing --force"
+        has_extra_arg --force || EXTRA_ARGS+=(--force)
+        ;;
+      *)
+        printf '%s\n' "$out" >&2
+        verdict=${verdict#REFUSE }
+        die "cephadm says $ORCH_HOST is not ok to stop: ${verdict%.}. Nothing has been changed."
+        ;;
+    esac
   fi
 }
 

@@ -346,14 +346,16 @@ hyperconverged VMs (etcd on k8s control nodes in particular). Leaving is
 cheap; rejoining is not.
 
 * `enter` first checks that cephadm will accept the host
-  (`ceph orch host ok-to-stop`), failing over an active mgr on it. If the
-  check fails it stops before changing anything. On hosts running RGW or NFS
-  the check only warns that clients may lose connectivity; accept that with
-  `enter <host> -- --force` once you know the other daemons (or a VIP) cover
-  for this host. `--force` is accepted only when every line of the refusal
-  is such a WARNING, because cephadm's own `--force` does not override a
-  mon/OSD/MDS refusal or an active mgr. It then saves each OSD's primary affinity in the
-  config-key store, sets per-OSD `noout`, moves primaries off the host
+  (`ceph orch host ok-to-stop`), failing over an active mgr on it, and stops
+  before changing anything if it would not. cephadm always warns that
+  stopping RGW or NFS daemons may cut clients off, however many other
+  instances exist; when every service it warns about still has a running
+  daemon on another active host, `enter` passes `--force` itself. Moving
+  clients to the surviving daemons is left to whatever fronts the service
+  (a VIP, DNS). Any other refusal (an active mgr with no standby, an
+  OSD/mon that is unsafe to stop, a service with no other instance) is not
+  overridden. It then saves each OSD's primary affinity in the config-key
+  store, sets per-OSD `noout`, moves primaries off the host
   (`primary-affinity 0`, one OSD at a time, waiting for peering), and enters
   cephadm maintenance. The OSDs stay down across any number of reboots until
   `exit`.
@@ -382,8 +384,8 @@ that is not a Ceph host is a silent no-op.
 state lives in the cluster, `exit` works from any host with the admin
 keyring, including the host itself after it reboots. The host defaults to the
 local machine; short names and FQDNs are both accepted. Arguments after `--`
-go to `ceph orch host maintenance` (`--force` for RGW/NFS warnings, or to exit
-an offline host). Timeouts are tunable through the `CEPH_HOST_MAINT_*`
+go to `ceph orch host maintenance` (for example `exit <host> -- --force` to
+bring back a host that is offline). Timeouts are tunable through the `CEPH_HOST_MAINT_*`
 environment variables listed by `ceph-host-maint --help`.
 
 Do not use `ceph osd set-group noup <host>` for this by hand: on a host name
